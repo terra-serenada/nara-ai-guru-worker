@@ -1,0 +1,12 @@
+{
+  "name": "nara-ai-guru-worker",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Cloudflare Worker proxy for Terra Serenada Nara using Anoman AI",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
