@@ -17,7 +17,7 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 const MAX_BODY_BYTES = 32 * 1024;
 const MAX_MESSAGES = 40;
-const MAX_TOKENS = 800;
+const MAX_TOKENS = 2000;
 
 function corsHeaders(origin) {
   const headers = new Headers({
