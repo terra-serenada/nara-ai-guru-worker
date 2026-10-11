@@ -13,7 +13,10 @@
 const ANOMAN_BASE_URL = "https://api.anoman.io/v1";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const ALLOWED_ORIGINS = new Set([
+  // GitHub Pages prototype / web app.
   "https://terra-serenada.github.io",
+  // Android APK: MainActivity loads index.html through WebViewAssetLoader.
+  "https://appassets.androidplatform.net",
 ]);
 const MAX_BODY_BYTES = 32 * 1024;
 const MAX_MESSAGES = 40;
@@ -47,8 +50,8 @@ function getOrigin(request) {
 
 function originAllowedForApi(request) {
   const origin = getOrigin(request);
-  // Browser calls from the GitHub Pages app are allowed. Reject other or missing
-  // origins on API routes; this is a basic barrier, not a substitute for rate limits.
+  // Allow only the published app and the trusted Android WebViewAssetLoader origin.
+  // This is a CORS guard, not authentication; the provider key remains server-side.
   return Boolean(origin && ALLOWED_ORIGINS.has(origin));
 }
 
@@ -163,7 +166,6 @@ export default {
         body: JSON.stringify(payload),
       }, origin);
 
-      // Add CORS for the approved app origin while preserving the upstream status/body.
       const headers = new Headers(upstreamResponse.headers);
       const allowedHeaders = corsHeaders(origin);
       for (const [key, value] of allowedHeaders.entries()) headers.set(key, value);
