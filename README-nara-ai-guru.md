@@ -38,3 +38,4 @@ The initial default model is `gpt-4o-mini`, which is shown in the Anoman dashboa
 ## Important
 
 The chat API currently permits browser requests only from `https://terra-serenada.github.io`. If the Terra Serenada app uses a different website origin, update `ALLOWED_ORIGINS` in `index.js` before deploying. Origin checks are a basic barrier, not full authentication or rate limiting.
+Build trigger.
