@@ -2,7 +2,12 @@
  * Terra Serenada - Nara AI Guru Worker
  * Provider: Anoman AI (OpenAI-compatible API)
  * Required Cloudflare secret: ANOMAN_AI
- * Default model: gpt-4o-mini (change only after checking the Anoman model catalog)
+ * Default model: gpt-4o-mini (unchanged; change only after checking model entitlement)
+ *
+ * Diagnostic update:
+ * - Logs sanitized upstream errors under [NARA_UPSTREAM_ERROR].
+ * - Includes safe diagnostic metadata in upstream error responses.
+ * - Never logs API secrets, request bodies, or conversation contents.
  *
  * Routes:
  *   GET  /        Health check
@@ -13,14 +18,13 @@
 const ANOMAN_BASE_URL = "https://api.anoman.io/v1";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const ALLOWED_ORIGINS = new Set([
-  // GitHub Pages prototype / web app.
   "https://terra-serenada.github.io",
-  // Android APK: MainActivity loads index.html through WebViewAssetLoader.
   "https://appassets.androidplatform.net",
 ]);
 const MAX_BODY_BYTES = 32 * 1024;
 const MAX_MESSAGES = 40;
 const MAX_TOKENS = 2000;
+const MAX_ERROR_TEXT = 500;
 
 function corsHeaders(origin) {
   const headers = new Headers({
@@ -50,15 +54,67 @@ function getOrigin(request) {
 
 function originAllowedForApi(request) {
   const origin = getOrigin(request);
-  // Allow only the published app and the trusted Android WebViewAssetLoader origin.
-  // This is a CORS guard, not authentication; the provider key remains server-side.
+  // This is an origin guard, not authentication. Keep ANOMAN_AI server-side.
   return Boolean(origin && ALLOWED_ORIGINS.has(origin));
 }
 
+function safeText(value, maxLength = MAX_ERROR_TEXT) {
+  if (typeof value !== "string") return undefined;
+  const compact = value.replace(/[\r\n\t]+/g, " ").trim();
+  if (!compact) return undefined;
+  return compact.length > maxLength ? `${compact.slice(0, maxLength)}…` : compact;
+}
+
+function extractUpstreamError(responseBody) {
+  const outer = responseBody && typeof responseBody === "object" ? responseBody : {};
+  const err = outer.error;
+  if (typeof err === "string") {
+    return { message: safeText(err) || "Anoman AI mengembalikan kesalahan." };
+  }
+  const errorObject = err && typeof err === "object" ? err : {};
+  return {
+    type: safeText(errorObject.type),
+    code: safeText(errorObject.code),
+    message: safeText(errorObject.message || outer.message) || "Anoman AI mengembalikan respons error tanpa pesan yang terbaca.",
+  };
+}
+
+function withDiagnostics(responseBody, diagnostics, errorInfo) {
+  if (responseBody && typeof responseBody === "object" && !Array.isArray(responseBody)) {
+    const result = { ...responseBody, naraDiagnostics: diagnostics };
+    // Keep the provider's error structure intact when it exists. If it does not,
+    // supply a compatible error object so the client has a usable message.
+    if (!result.error) {
+      result.error = {
+        type: errorInfo.type || "upstream_error",
+        code: errorInfo.code || "upstream_error",
+        message: errorInfo.message,
+      };
+    }
+    return result;
+  }
+  return {
+    error: {
+      type: errorInfo.type || "upstream_error",
+      code: errorInfo.code || "upstream_error",
+      message: errorInfo.message,
+    },
+    naraDiagnostics: diagnostics,
+  };
+}
+
 async function anomanFetch(path, env, init = {}, origin = null) {
-  if (!env.ANOMAN_AI) {
+  if (!env || !env.ANOMAN_AI) {
+    console.error("[NARA_CONFIG_ERROR]", JSON.stringify({
+      code: "missing_anoman_secret",
+      route: path,
+    }));
     return jsonResponse({
-      error: "Secret ANOMAN_AI belum disetel di Cloudflare Worker.",
+      error: {
+        type: "configuration_error",
+        code: "missing_anoman_secret",
+        message: "Secret ANOMAN_AI belum disetel di Cloudflare Worker.",
+      },
     }, 500, origin);
   }
 
@@ -73,25 +129,80 @@ async function anomanFetch(path, env, init = {}, origin = null) {
       ...init,
       headers,
     });
-  } catch (_error) {
-    return jsonResponse({ error: "Tidak dapat terhubung ke layanan Anoman AI." }, 502, origin);
+  } catch (error) {
+    const errorName = error && typeof error.name === "string" ? error.name : "FetchError";
+    console.error("[NARA_UPSTREAM_NETWORK_ERROR]", JSON.stringify({
+      provider: "Anoman AI",
+      route: path,
+      model: path === "/chat/completions" ? DEFAULT_MODEL : undefined,
+      errorName: safeText(errorName, 80),
+    }));
+    return jsonResponse({
+      error: {
+        type: "upstream_network_error",
+        code: "anoman_unreachable",
+        message: "Tidak dapat terhubung ke layanan Anoman AI. Periksa kembali nanti.",
+      },
+      naraDiagnostics: {
+        provider: "Anoman AI",
+        route: path,
+        model: path === "/chat/completions" ? DEFAULT_MODEL : null,
+        upstreamStatus: null,
+      },
+    }, 502, origin);
   }
 
+  const contentType = upstream.headers.get("Content-Type") || "";
+  const providerRequestId = upstream.headers.get("x-request-id") || upstream.headers.get("request-id") || null;
   const responseText = await upstream.text();
   let responseBody;
+  let jsonParsed = true;
   try {
     responseBody = responseText ? JSON.parse(responseText) : {};
   } catch (_error) {
-    responseBody = { error: "Layanan Anoman mengembalikan respons yang tidak dikenali." };
+    jsonParsed = false;
+    responseBody = {};
   }
 
-  return new Response(JSON.stringify(responseBody), {
-    status: upstream.status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      ...Object.fromEntries(corsHeaders(origin).entries()),
-    },
-  });
+  const model = path === "/chat/completions" ? DEFAULT_MODEL : null;
+  const diagnostics = {
+    provider: "Anoman AI",
+    route: path,
+    upstreamStatus: upstream.status,
+    model,
+    providerRequestId: safeText(providerRequestId, 120) || null,
+  };
+
+  if (!jsonParsed) {
+    const errorInfo = {
+      type: "upstream_invalid_response",
+      code: "non_json_response",
+      message: "Anoman AI mengembalikan respons yang bukan JSON. Lihat status upstream dan Content-Type di log Worker.",
+    };
+    console.error("[NARA_UPSTREAM_INVALID_JSON]", JSON.stringify({
+      ...diagnostics,
+      contentType: safeText(contentType, 120) || null,
+      responseBytes: new TextEncoder().encode(responseText).byteLength,
+    }));
+    const status = upstream.ok ? 502 : upstream.status;
+    return jsonResponse(withDiagnostics({ error: errorInfo }, diagnostics, errorInfo), status, origin);
+  }
+
+  if (!upstream.ok) {
+    const errorInfo = extractUpstreamError(responseBody);
+    // Deliberately omit request payloads, conversation text, authorization, and secrets.
+    console.error("[NARA_UPSTREAM_ERROR]", JSON.stringify({
+      ...diagnostics,
+      errorType: errorInfo.type || null,
+      errorCode: errorInfo.code || null,
+      errorMessage: errorInfo.message,
+      contentType: safeText(contentType, 120) || null,
+    }));
+    return jsonResponse(withDiagnostics(responseBody, diagnostics, errorInfo), upstream.status, origin);
+  }
+
+  // Preserve the provider's successful response format for existing Nara clients.
+  return jsonResponse(responseBody, upstream.status, origin);
 }
 
 export default {
@@ -161,18 +272,10 @@ export default {
         stream: false,
       };
 
-      const upstreamResponse = await anomanFetch("/chat/completions", env, {
+      return anomanFetch("/chat/completions", env, {
         method: "POST",
         body: JSON.stringify(payload),
       }, origin);
-
-      const headers = new Headers(upstreamResponse.headers);
-      const allowedHeaders = corsHeaders(origin);
-      for (const [key, value] of allowedHeaders.entries()) headers.set(key, value);
-      return new Response(upstreamResponse.body, {
-        status: upstreamResponse.status,
-        headers,
-      });
     }
 
     return jsonResponse({ error: "Rute tidak ditemukan." }, 404, origin);
