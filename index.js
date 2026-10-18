@@ -65,17 +65,52 @@ function safeText(value, maxLength = MAX_ERROR_TEXT) {
   return compact.length > maxLength ? `${compact.slice(0, maxLength)}…` : compact;
 }
 
-function extractUpstreamError(responseBody) {
-  const outer = responseBody && typeof responseBody === "object" ? responseBody : {};
-  const err = outer.error;
-  if (typeof err === "string") {
-    return { message: safeText(err) || "Anoman AI mengembalikan kesalahan." };
+function inferErrorType(code, fallbackType) {
+  if (fallbackType) return fallbackType;
+  if (code === "token_quota_exceeded" || code === "budget_exceeded" ||
+      code === "insufficient_credits" || code === "insufficient_balance") {
+    return "billing_error";
   }
-  const errorObject = err && typeof err === "object" ? err : {};
+  return undefined;
+}
+
+function extractUpstreamError(responseBody, status) {
+  const outer = responseBody && typeof responseBody === "object" && !Array.isArray(responseBody)
+    ? responseBody : {};
+  const detail = outer.detail && typeof outer.detail === "object" ? outer.detail : {};
+  const data = outer.data && typeof outer.data === "object" ? outer.data : {};
+  const nestedError = data.error && typeof data.error === "object" ? data.error : {};
+  const err = outer.error && typeof outer.error === "object" ? outer.error : {};
+
+  // Anoman responses may use the OpenAI-style {error:{...}} envelope, or
+  // the quota envelope {detail:{error:"token_quota_exceeded", ...}}.
+  const rawCode = err.code || detail.code || nestedError.code ||
+    (typeof detail.error === "string" ? detail.error : undefined) ||
+    (typeof outer.error === "string" ? outer.error : undefined) ||
+    outer.code || data.code;
+  const code = safeText(rawCode, 120);
+  const type = safeText(err.type || detail.type || nestedError.type || outer.type, 120);
+  const modelTierClass = safeText(detail.model_tier_class || outer.model_tier_class || data.model_tier_class, 80);
+  const window = safeText(detail.window || outer.window || data.window, 40);
+  let message = safeText(err.message || detail.message || nestedError.message || outer.message || data.message);
+
+  if (!message && code === "token_quota_exceeded") {
+    message = `Kuota token Anoman untuk kelas model ${modelTierClass || "yang digunakan"} telah tercapai${window ? ` pada periode ${window}` : ""}.`;
+  } else if (!message && code === "budget_exceeded") {
+    message = "Batas anggaran bulanan Anoman untuk API key ini telah tercapai.";
+  } else if (!message && (code === "insufficient_credits" || code === "insufficient_balance")) {
+    message = "Saldo atau kredit Anoman untuk permintaan ini tidak mencukupi.";
+  } else if (!message && typeof outer.detail === "string") {
+    message = safeText(outer.detail);
+  }
+
+  if (!message) message = "Anoman AI mengembalikan respons error tanpa pesan yang terbaca.";
   return {
-    type: safeText(errorObject.type),
-    code: safeText(errorObject.code),
-    message: safeText(errorObject.message || outer.message) || "Anoman AI mengembalikan respons error tanpa pesan yang terbaca.",
+    type: inferErrorType(code, type) || (status === 402 ? "billing_error" : undefined),
+    code,
+    message,
+    modelTierClass: modelTierClass || undefined,
+    window: window || undefined,
   };
 }
 
@@ -153,7 +188,11 @@ async function anomanFetch(path, env, init = {}, origin = null) {
   }
 
   const contentType = upstream.headers.get("Content-Type") || "";
-  const providerRequestId = upstream.headers.get("x-request-id") || upstream.headers.get("request-id") || null;
+  const providerRequestId = upstream.headers.get("x-request-id") ||
+    upstream.headers.get("request-id") || null;
+  const providerTier = upstream.headers.get("x-anoman-tier") || null;
+  const providerRegion = upstream.headers.get("x-anoman-region") || null;
+  const providerCache = upstream.headers.get("x-anoman-cache") || null;
   const responseText = await upstream.text();
   let responseBody;
   let jsonParsed = true;
@@ -171,6 +210,9 @@ async function anomanFetch(path, env, init = {}, origin = null) {
     upstreamStatus: upstream.status,
     model,
     providerRequestId: safeText(providerRequestId, 120) || null,
+    providerTier: safeText(providerTier, 80) || null,
+    providerRegion: safeText(providerRegion, 40) || null,
+    providerCache: safeText(providerCache, 80) || null,
   };
 
   if (!jsonParsed) {
@@ -189,13 +231,20 @@ async function anomanFetch(path, env, init = {}, origin = null) {
   }
 
   if (!upstream.ok) {
-    const errorInfo = extractUpstreamError(responseBody);
+    const errorInfo = extractUpstreamError(responseBody, upstream.status);
+    diagnostics.modelTierClass = errorInfo.modelTierClass || null;
+    diagnostics.quotaWindow = errorInfo.window || null;
     // Deliberately omit request payloads, conversation text, authorization, and secrets.
     console.error("[NARA_UPSTREAM_ERROR]", JSON.stringify({
       ...diagnostics,
       errorType: errorInfo.type || null,
       errorCode: errorInfo.code || null,
       errorMessage: errorInfo.message,
+      modelTierClass: errorInfo.modelTierClass || null,
+      quotaWindow: errorInfo.window || null,
+      responseTopLevelKeys: Object.keys(responseBody || {}).slice(0, 20),
+      responseDetailKeys: responseBody && responseBody.detail && typeof responseBody.detail === "object"
+        ? Object.keys(responseBody.detail).slice(0, 20) : [],
       contentType: safeText(contentType, 120) || null,
     }));
     return jsonResponse(withDiagnostics(responseBody, diagnostics, errorInfo), upstream.status, origin);
